@@ -4,7 +4,9 @@ CAC 40 Stochastic Lab - Streamlit app
 
 Tab 1  Single share : GARCH-t volatility, HMM regimes, Monte Carlo, OU mean
                       reversion -> entry score, decline-risk score, limit levels
-Tab 2  CAC 40 portfolio : holdings P&L, risk (VaR/CVaR, beta, drawdown, risk
+Tab 2  Entry / Exit : ISIN, name or ticker -> entry zone, stop, take-profit and
+                      trailing-stop price ranges on a chart + ENTRY / NEUTRAL / OUT call
+Tab 3  CAC 40 portfolio : holdings P&L, risk (VaR/CVaR, beta, drawdown, risk
                       contributions), market regime, CAC 40 entry screener
 Decision aid only - not investment advice.
 """
@@ -17,6 +19,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import insights as ins
+import isin as isn
 import quant as q
 
 st.set_page_config(page_title="CAC 40 Stochastic Lab", page_icon="📈", layout="wide")
@@ -42,6 +46,8 @@ CAC40 = {
     "Unibail-Rodamco-Westfield": "URW.PA", "Veolia": "VIE.PA", "Vinci": "DG.PA",
 }
 NAME_OF = {v: k for k, v in CAC40.items()}
+CALL_STYLE = {"ENTRY": ("🟢", st.success), "NEUTRAL": ("🟡", st.warning),
+              "OUT": ("🔴", st.error)}
 INDEX = "^FCHI"
 PERIOD_DAYS = {"3y": 756, "5y": 1260, "10y": 2520, "15y": 3780}
 
@@ -66,6 +72,32 @@ def show(fig):
 
 def pct(x, d=1):
     return "–" if x is None or pd.isna(x) else f"{x:.{d}%}"
+
+
+def insight(text: str):
+    """One-sentence plain-language reading of the tab."""
+    st.info(text, icon="💡")
+
+
+def online() -> bool:
+    return st.session_state.get("source", "Yahoo Finance") == "Yahoo Finance"
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def lookup_isin(code: str, use_online: bool):
+    r = isn.resolve_isin(code, online=use_online)
+    return r.__dict__
+
+
+def to_ticker(x: str) -> str:
+    """Accept a Yahoo ticker or an ISIN; return a Yahoo ticker."""
+    x = (x or "").strip().upper()
+    if isn.isin_valid(x):
+        try:
+            return lookup_isin(isn.clean_isin(x), online())["ticker"]
+        except Exception:
+            return x
+    return x
 
 
 # --------------------------------------------------------------------------- #
@@ -138,6 +170,11 @@ def run_analysis(prices: pd.Series, horizon, n_paths, model, drift, target, stop
                      target=target, stop=stop, n_states=n_states)
 
 
+@st.cache_data(show_spinner=False, max_entries=30)
+def run_plan(_a: q.Analysis, key: str, stop_atr: float, trail_atr: float):
+    return q.trade_plan(_a, stop_atr=stop_atr, trail_atr=trail_atr)
+
+
 @st.cache_data(show_spinner=False, max_entries=10)
 def run_backtest(_a: q.Analysis, key: str, fwd: int):
     return q.signal_backtest(_a, fwd=fwd)
@@ -192,12 +229,13 @@ with st.sidebar:
                "not investment advice.")
 
 st.title("📈 CAC 40 Stochastic Lab")
-tab1, tab2, tab3 = st.tabs(["🎯 Single share", "🧺 CAC 40 portfolio", "ℹ️ Method"])
+tab1, tab_tr, tab2, tab3 = st.tabs(["🎯 Single share", "🚦 Entry / Exit",
+                                   "🧺 CAC 40 portfolio", "ℹ️ Method"])
 
 # =========================================================================== #
 # TAB 1 - single share
 # =========================================================================== #
-with tab1:
+def render_single():
     c1, c2 = st.columns([2, 1])
     with c1:
         names = list(CAC40) + ["Other ticker…"]
@@ -227,7 +265,7 @@ with tab1:
     px = get_prices([ticker], period)
     if px.empty or ticker not in px or px[ticker].dropna().shape[0] < 300:
         st.warning(f"Not enough price history for {ticker} (need ≥ 300 trading days).")
-        st.stop()
+        return
     s = px[ticker].dropna()
 
     with st.spinner("Fitting GARCH, HMM and simulating paths…"):
@@ -289,6 +327,7 @@ with tab1:
             fig.add_hline(y=a.ou.fair_value, line_dash="dot", line_color=C_GRAY,
                           annotation_text="OU fair value")
         show(style(fig, 440, "Price"))
+        insight(ins.price(a, NAME_OF.get(ticker, ticker)))
         st.caption("Background colour = most likely HMM regime that day (filtered, no "
                    "look-ahead): " + " · ".join(f"{l}" for l in a.hmm.labels) +
                    f". Hurst exponent {stt['hurst']:.2f} (<0.5 mean-reverting, >0.5 trending).")
@@ -323,6 +362,7 @@ with tab1:
         fig.update_xaxes(title="Trading days from today")
         show(style(fig, 440, "Price"))
 
+        insight(ins.monte_carlo(a, horizon, target, stop))
         m = st.columns(5)
         m[0].metric("P(up at horizon)", pct(a.mc["p_up"], 0))
         m[1].metric("Median return", pct(a.mc["median_ret"]))
@@ -352,6 +392,7 @@ with tab1:
         fig.add_hline(y=g.long_run_vol_ann * 100, line_dash="dot", line_color=C_ORANGE,
                       annotation_text="long-run")
         show(style(fig, 380, "Annualised vol (%)"))
+        insight(ins.volatility(a))
         fc = g.forecast_vol(max(horizon, 60)) * np.sqrt(q.TRADING_DAYS) * 100
         fig = go.Figure(go.Scatter(x=np.arange(1, len(fc) + 1), y=fc, name="Forecast",
                                    line=dict(color=C_BLUE, width=2)))
@@ -372,6 +413,7 @@ with tab1:
                             line=dict(width=0.5, color=REGIME_COL.get(lab, C_GRAY)))
         fig.update_yaxes(range=[0, 1], tickformat=".0%")
         show(style(fig, 340, "Filtered probability"))
+        insight(ins.regimes(a))
         reg = pd.DataFrame({
             "Regime": a.hmm.labels,
             "Daily mean": [f"{m:+.3%}" for m in a.hmm.means],
@@ -396,6 +438,7 @@ with tab1:
         fig.update_yaxes(range=[0, 1.05], tickformat=".0%")
         fig.update_xaxes(title="Limit below current price")
         show(style(fig, 300, "Probability of fill"))
+        insight(ins.limits(a, horizon))
         st.dataframe(lt, hide_index=True, width="stretch", column_config={
             "discount": st.column_config.NumberColumn("Discount", format="percent"),
             "limit_price": st.column_config.NumberColumn("Limit price", format="%.2f"),
@@ -412,6 +455,7 @@ with tab1:
     with t_bt:
         fwd = st.slider("Forward window (days)", 5, 60, 20, 5)
         tab, score = run_backtest(a, f"{ticker}-{period}-{n_states}-{len(s)}", fwd)
+        insight(ins.backtest(tab, fwd))
         st.dataframe(tab, width="stretch", column_config={
             "days": st.column_config.NumberColumn("Days"),
             "mean_fwd": st.column_config.NumberColumn(f"Mean {fwd}d return", format="percent"),
@@ -427,6 +471,156 @@ with tab1:
                    "history, so results are somewhat optimistic. A useful score shows a "
                    "higher mean return and hit rate in the top bucket than in 'All days'.")
 
+
+with tab1:
+    render_single()
+
+
+# =========================================================================== #
+# TAB - Entry / Exit
+# =========================================================================== #
+def render_trade():
+    st.markdown("Find a share by **ISIN**, by name or by Yahoo ticker, and get its entry, "
+                "stop and exit price ranges with a clear call.")
+    how = st.radio("Find share by", ["ISIN code", "CAC 40 list", "Yahoo ticker"],
+                   horizontal=True, key="tr_how")
+    info = {}
+    if how == "ISIN code":
+        code = st.text_input("ISIN", "FR0000121014", key="tr_isin",
+                             help="12 characters, e.g. FR0000121014 (LVMH), "
+                                  "NL0000235190 (Airbus), FR0000120271 (TotalEnergies)")
+        if not isn.isin_valid(code):
+            st.error(f"“{code}” is not a valid ISIN – check the 12 characters and the "
+                     "final check digit.")
+            return
+        try:
+            info = lookup_isin(isn.clean_isin(code), online())
+        except Exception as e:
+            st.error(str(e) + ("" if online() else " Switch the data source to Yahoo "
+                               "Finance to look up non-CAC 40 ISINs."))
+            return
+        ticker, name = info["ticker"], info["name"]
+        st.caption(f"✓ {info['isin']} → **{name}** ({ticker}) · found via {info['source']}")
+    elif how == "CAC 40 list":
+        name = st.selectbox("Share", list(CAC40), index=list(CAC40).index("TotalEnergies"),
+                            key="tr_pick")
+        ticker = CAC40[name]
+    else:
+        ticker = st.text_input("Yahoo ticker", "GTT.PA", key="tr_tk").strip().upper()
+        name = NAME_OF.get(ticker, ticker)
+    if "isin" not in info and ticker in isn.ISIN_OF_TICKER:
+        st.caption(f"ISIN {isn.ISIN_OF_TICKER[ticker]}")
+
+    c = st.columns(3)
+    horizon = c[0].slider("Holding horizon (trading days)", 5, 60, 20, 5, key="tr_h")
+    stop_atr = c[1].slider("Stop distance (× daily range)", 1.0, 4.0, 2.0, 0.5, key="tr_sa",
+                           help="Stop = bottom of entry zone − this many ATRs.")
+    trail_atr = c[2].slider("Trailing stop (× daily range)", 2.0, 5.0, 3.0, 0.5, key="tr_ta",
+                            help="Chandelier exit for holders: highest close of the last "
+                                 "22 days − this many ATRs.")
+
+    px = get_prices([ticker], period)
+    if px.empty or ticker not in px or px[ticker].dropna().shape[0] < 300:
+        st.warning(f"Not enough price history for {ticker} (need ≥ 300 trading days).")
+        return
+    s = px[ticker].dropna()
+    with st.spinner("Modelling entry and exit ranges…"):
+        a = run_analysis(s, horizon, 5000, "GARCH-t", "Zero", 0.08, 0.05, 3)
+        tp = run_plan(a, f"{ticker}-{period}-{horizon}-{len(s)}-{s.iloc[-1]}",
+                      stop_atr, trail_atr)
+
+    icon, box = CALL_STYLE[tp.call]
+    box(f"### {icon} {tp.call}\n{tp.headline}")
+    insight(ins.trade(tp, name))
+
+    k = st.columns(6)
+    k[0].metric("Last price", f"{tp.last:,.2f}", pct(a.stats["chg_1d"], 2))
+    k[1].metric("Entry zone", f"{tp.entry_low:,.2f} – {tp.entry_high:,.2f}")
+    k[2].metric("Stop-loss", f"{tp.stop:,.2f}", pct(tp.stop / tp.last - 1), delta_color="off")
+    k[3].metric("Take-profit", f"{tp.tp1:,.2f} – {tp.tp2:,.2f}",
+                pct(tp.tp1 / tp.last - 1), delta_color="off")
+    k[4].metric("Risk / reward", f"{tp.risk_reward:.1f}")
+    k[5].metric("Trailing stop", f"{tp.trailing_stop:,.2f}", pct(tp.trailing_stop / tp.last - 1),
+                delta_color="off")
+
+    # ---- chart: history + forecast cone + price ranges -----------------------
+    win = st.select_slider("History shown", ["3M", "6M", "1Y", "2Y"], "6M", key="tr_win")
+    n = {"3M": 63, "6M": 126, "1Y": 252, "2Y": 504}[win]
+    p = s.iloc[-n:]
+    fut = pd.bdate_range(p.index[-1] + pd.Timedelta(days=1), periods=horizon)
+    xf = [p.index[-1]] + list(fut)
+    qs = np.quantile(a.paths, [0.05, 0.25, 0.5, 0.75, 0.95], axis=0)
+    fig = go.Figure()
+    bands = [
+        (tp.tp1, tp.tp2, "rgba(42,120,214,0.16)", "Take-profit zone", C_BLUE),
+        (tp.entry_low, tp.entry_high, "rgba(27,175,122,0.20)",
+         "Re-entry zone" if tp.call == "OUT" else "Entry zone", C_AQUA),
+        (tp.stop_low, tp.stop, "rgba(227,73,72,0.18)", "Stop zone", REGIME_COL["Bear"]),
+    ]
+    for y0, y1, fill, label, col in bands:
+        fig.add_hrect(y0=y0, y1=y1, fillcolor=fill, line_width=0, layer="below",
+                      annotation_text=f"{label}  {y0:,.2f}–{y1:,.2f}",
+                      annotation_position="top left", annotation_font_color=col)
+    fig.add_scatter(x=xf, y=qs[4], line=dict(width=0), showlegend=False, hoverinfo="skip")
+    fig.add_scatter(x=xf, y=qs[0], fill="tonexty", line=dict(width=0),
+                    fillcolor="rgba(138,137,132,0.15)", name="Forecast 5–95%")
+    fig.add_scatter(x=xf, y=qs[3], line=dict(width=0), showlegend=False, hoverinfo="skip")
+    fig.add_scatter(x=xf, y=qs[1], fill="tonexty", line=dict(width=0),
+                    fillcolor="rgba(138,137,132,0.28)", name="Forecast 25–75%")
+    fig.add_scatter(x=xf, y=qs[2], name="Forecast median",
+                    line=dict(color=C_GRAY, width=1.5, dash="dot"))
+    fig.add_scatter(x=p.index, y=s.rolling(200).mean().reindex(p.index), name="200-day MA",
+                    line=dict(color=C_AQUA, width=1))
+    fig.add_scatter(x=p.index, y=s.rolling(50).mean().reindex(p.index), name="50-day MA",
+                    line=dict(color=C_ORANGE, width=1))
+    fig.add_scatter(x=p.index, y=p, name="Price", line=dict(color=C_BLUE, width=2))
+    fig.add_hline(y=tp.trailing_stop, line_dash="dash", line_color=C_ORANGE, line_width=1.5,
+                  annotation_text=f"Trailing stop {tp.trailing_stop:,.2f}",
+                  annotation_position="bottom right", annotation_font_color=C_ORANGE)
+    fig.add_scatter(x=[p.index[-1]], y=[tp.last], mode="markers+text", name="Today",
+                    marker=dict(size=10, color=C_BLUE, line=dict(color="white", width=2)),
+                    text=[f" {tp.last:,.2f}"], textposition="middle right", showlegend=False)
+    lo = min(p.min(), tp.stop_low, qs[0].min()) * 0.98
+    hi = max(p.max(), tp.tp2, qs[4].max()) * 1.02
+    fig.update_yaxes(range=[lo, hi])
+    show(style(fig, 520, "Price"))
+    st.caption("Green = where to buy, red = where to cut a new position, blue = where to take "
+               "profits, orange dashed = exit line for existing holders. Grey cone = simulated "
+               f"price range over the next {horizon} trading days (GARCH-t Monte Carlo).")
+
+    # ---- ladder + advice --------------------------------------------------------
+    cl, cr = st.columns([3, 2])
+    with cl:
+        st.markdown("**Price ladder**")
+        st.dataframe(tp.levels, hide_index=True, width="stretch", column_config={
+            "Price": st.column_config.NumberColumn(format="%.2f"),
+            "vs current": st.column_config.NumberColumn(format="percent"),
+            "P(touched)": st.column_config.ProgressColumn(
+                f"P(touched in {horizon}d)", min_value=0, max_value=1, format="percent")})
+    with cr:
+        st.markdown("**If you don't hold it**")
+        st.markdown(tp.headline)
+        st.markdown("**If you already hold it**")
+        st.markdown(tp.holder_action)
+        st.markdown("**Context**")
+        st.markdown("\n".join(f"- {r}" for r in tp.reasons +
+                              [f"Regime: {a.stats['regime']} · RSI {a.stats['rsi']:.0f} · "
+                               f"vol {pct(a.garch.next_vol_ann, 0)} vs long-run "
+                               f"{pct(a.garch.long_run_vol_ann, 0)}"]))
+        if a.warnings:
+            st.markdown("\n".join(f"- ⚠️ {w}" for w in a.warnings))
+    sup = pd.DataFrame({"Reference": list(tp.supports), "Price": list(tp.supports.values())})
+    sup["vs current"] = sup.Price / tp.last - 1
+    with st.expander("Support / reference levels"):
+        st.dataframe(sup, hide_index=True, width="stretch", column_config={
+            "Price": st.column_config.NumberColumn(format="%.2f"),
+            "vs current": st.column_config.NumberColumn(format="percent")})
+
+
+with tab_tr:
+    render_trade()
+
+
 # =========================================================================== #
 # TAB 2 - portfolio
 # =========================================================================== #
@@ -439,10 +633,11 @@ with tab2:
             "Avg cost": [600.0, 55.0, 160.0, 90.0, 60.0]})
     h = st.data_editor(st.session_state.holdings, num_rows="dynamic", width="stretch",
                        key="hold_editor", column_config={
-                           "Ticker": st.column_config.TextColumn(help="Yahoo ticker, e.g. OR.PA"),
+                           "Ticker": st.column_config.TextColumn(
+                               help="Yahoo ticker (e.g. OR.PA) or ISIN (e.g. FR0000120321)"),
                            "Quantity": st.column_config.NumberColumn(min_value=0, step=1),
                            "Avg cost": st.column_config.NumberColumn(min_value=0, format="%.2f")})
-    h = h.dropna(subset=["Ticker"]).assign(Ticker=lambda d: d.Ticker.str.strip().str.upper())
+    h = h.dropna(subset=["Ticker"]).assign(Ticker=lambda d: d.Ticker.map(to_ticker))
     h = h[(h.Quantity > 0)].groupby("Ticker", as_index=False).agg(
         Quantity=("Quantity", "sum"), **{"Avg cost": ("Avg cost", "mean")})
 
@@ -477,8 +672,7 @@ with tab2:
             if bench is not None and len(bench) > 500:
                 mh = q.fit_hmm(q.log_returns(bench).iloc[-4 * q.TRADING_DAYS:], reg_states)
                 lab = mh.labels[int(np.argmax(mh.next_day))]
-                msg = (f"CAC 40 market regime: **{lab}** · P(bear tomorrow) "
-                       f"{mh.next_day[0]:.0%}")
+                msg = ins.market(lab, mh.next_day[0])
                 (st.error if mh.next_day[0] > 0.5 else st.success if lab == "Bull"
                  else st.info)(msg)
 
@@ -493,6 +687,7 @@ with tab2:
             k[4].metric("Beta vs CAC 40", f"{ps['beta']:.2f}" if pd.notna(ps["beta"]) else "–")
             k[5].metric(f"{var_h}d VaR 95%", f"€{ps['var95'] * tot:,.0f}",
                         f"CVaR €{ps['cvar95'] * tot:,.0f}", delta_color="off")
+            insight(ins.holdings(tot, pnl, ps, var_h))
 
             st.dataframe(h[["Ticker", "Name", "Quantity", "Avg cost", "Last", "Value", "P&L",
                             "P&L %", "1D", "Weight"]], hide_index=True, width="stretch",
@@ -521,6 +716,7 @@ with tab2:
                                            line=dict(color=REGIME_COL["Bear"], width=1),
                                            name="Drawdown"))
                 show(style(fig, 220, f"Drawdown % (max {ps['mdd']:.0%})"))
+                insight(ins.performance(ps, bench))
             with g2:
                 rc = pd.DataFrame({"Weight": w, "Risk contribution": ps["risk_contrib"]})
                 fig = go.Figure()
@@ -535,6 +731,7 @@ with tab2:
                                            zmin=-1, zmax=1, colorscale="RdBu_r",
                                            text=corr.round(2).values, texttemplate="%{text}"))
                 show(style(fig, 280, None).update_layout(hovermode="closest"))
+                insight(ins.risk(ps, w, NAME_OF))
             st.caption("Historical risk uses today's weights applied to past returns. VaR is "
                        "from a 5-day block bootstrap of joint returns, which keeps the "
                        "correlations between holdings.")
@@ -558,6 +755,7 @@ with tab2:
             st.session_state.scan = run_screener(upx, s_h, s_t, s_s)
     if "scan" in st.session_state and not st.session_state.scan.empty:
         sc = st.session_state.scan.sort_values("Entry score", ascending=False)
+        insight(ins.screener(sc))
         st.dataframe(sc, hide_index=True, width="stretch", height=520, column_config={
             "Last": st.column_config.NumberColumn(format="%.2f"),
             "1M": st.column_config.NumberColumn(format="percent"),
@@ -597,6 +795,19 @@ cross 15%, volatility stress 15%, RSI overbought 10%.
 ### Verdicts
 *Favourable entry*: entry ≥ 65 and decline < 40 · *Decline risk – wait*: decline ≥ 55 ·
 *Neutral*: entry ≥ 50 · otherwise *Unfavourable*.
+
+### Entry / Exit levels
+* **Entry zone** – a band below today's price sized by the GARCH volatility expected over the
+  holding horizon (σₕ): 0 → 0.75 σₕ below for ENTRY, 0.25 → 1 σₕ
+  for NEUTRAL (wait for a dip), 0.5 → 1.5 σₕ re-entry zone for OUT.
+* **Stop-loss** – bottom of the entry zone minus 2 × ATR (average daily move).
+* **Take-profit zone** – 75th to 90th percentile of simulated prices at the horizon.
+* **Trailing stop** (holders) – highest close of the last 22 days minus 3 × ATR.
+* **Call** – OUT if decline risk ≥ 55, bear regime > 50 %, or price below both the trailing
+  stop and the 200-day average · ENTRY if entry score ≥ 65, decline risk < 40 and risk/reward
+  ≥ 1.2 · otherwise NEUTRAL.
+* **ISIN lookup** – CAC 40 ISINs are built in; other ISINs are resolved online through
+  OpenFIGI, then Yahoo search.
 
 ### Limits
 Filtered probabilities use only past data, but parameters are estimated on the full

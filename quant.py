@@ -580,3 +580,128 @@ def synthetic_prices(tickers, n_days: int = 2520, end=None) -> pd.DataFrame:
             p0 = float(g.uniform(15, 600))
         out[tk] = p0 * np.exp(np.cumsum(r))
     return pd.DataFrame(out, index=idx)
+
+
+# --------------------------------------------------------------------------- #
+# Trade plan: entry zone, stop, take-profit zone, trailing stop, call
+# --------------------------------------------------------------------------- #
+@dataclass
+class TradePlan:
+    call: str                 # "ENTRY" | "NEUTRAL" | "OUT"
+    headline: str
+    holder_action: str
+    last: float
+    entry_low: float
+    entry_high: float
+    stop: float
+    stop_low: float
+    tp1: float
+    tp2: float
+    trailing_stop: float
+    atr: float
+    sigma_h: float
+    risk_reward: float
+    levels: pd.DataFrame      # ladder with touch probabilities
+    supports: dict
+    reasons: list = field(default_factory=list)
+
+
+def atr_close(prices: pd.Series, n: int = 14) -> float:
+    """Average true range proxy from closes only (EMA of |daily change|)."""
+    return float(prices.diff().abs().ewm(alpha=1 / n, adjust=False).mean().iloc[-1])
+
+
+def trade_plan(a: Analysis, stop_atr: float = 2.0, trail_atr: float = 3.0) -> TradePlan:
+    p = a.prices
+    S0 = float(p.iloc[-1])
+    P = a.paths
+    h = P.shape[1] - 1
+    atr = atr_close(p)
+    sig_h = float(np.sqrt(np.sum(a.garch.forecast_vol(h) ** 2)))   # horizon vol (log)
+    st_ = a.stats
+    supports = {"50-day MA": st_["ma50"], "200-day MA": st_["ma200"],
+                "60-day low": float(p.iloc[-60:].min())}
+    if a.ou.mean_reverting:
+        supports["OU fair value"] = a.ou.fair_value
+    trailing = float(p.iloc[-22:].max() - trail_atr * atr)        # chandelier exit
+    term = P[:, -1]
+    tp1, tp2 = float(np.quantile(term, 0.75)), float(np.quantile(term, 0.90))
+
+    out_reasons = []
+    if a.decline_score >= 55:
+        out_reasons.append(f"decline-risk score {a.decline_score:.0f}/100")
+    if st_["p_bear_next"] > 0.5:
+        out_reasons.append(f"bear regime likely ({st_['p_bear_next']:.0%})")
+    if S0 < trailing and S0 < st_["ma200"]:
+        out_reasons.append("price broke its trailing stop and the 200-day average")
+
+    # entry zone depends on the call (buy now / wait for a dip / re-entry later)
+    def zone(top, bottom):
+        return S0 * np.exp(-top * sig_h), S0 * np.exp(-bottom * sig_h)
+
+    if out_reasons:
+        call = "OUT"
+        hi, lo = zone(0.5, 1.5)
+    else:
+        hi, lo = zone(0.0, 0.75)
+        stop_ = lo - stop_atr * atr
+        mid = (hi + lo) / 2
+        rr_now = (tp1 - mid) / max(1e-9, mid - stop_)
+        if a.entry_score >= 65 and a.decline_score < 40 and rr_now >= 1.2:
+            call = "ENTRY"
+        else:
+            call = "NEUTRAL"
+            hi, lo = zone(0.25, 1.0)
+    stop = lo - stop_atr * atr
+    mid = (hi + lo) / 2
+    tp1 = max(tp1, hi + atr)
+    tp2 = max(tp2, tp1 + atr)
+    rr = (tp1 - mid) / max(1e-9, mid - stop)
+
+    mins, maxs = P.min(1), P.max(1)
+
+    def first_hit(level, up):
+        hit = (P >= level) if up else (P <= level)
+        return np.where(hit.any(1), hit.argmax(1), h + 1)
+
+    i_tp, i_sl = first_hit(tp1, True), first_hit(stop, False)
+    rows = [
+        ("Take-profit 2", tp2, (maxs >= tp2).mean()),
+        ("Take-profit 1", tp1, (maxs >= tp1).mean()),
+        ("Current price", S0, 1.0),
+        ("Entry zone – top", hi, (mins <= hi).mean()),
+        ("Entry zone – bottom", lo, (mins <= lo).mean()),
+        ("Trailing stop (holders)", trailing, (mins <= trailing).mean() if trailing < S0 else 1.0),
+        ("Stop-loss (new entry)", stop, (mins <= stop).mean()),
+    ]
+    levels = pd.DataFrame(rows, columns=["Level", "Price", "P(touched)"])
+    levels["vs current"] = levels.Price / S0 - 1
+    levels = levels.sort_values("Price", ascending=False, ignore_index=True)
+
+    name_rr = f"risk/reward {rr:.1f}"
+    if call == "ENTRY":
+        headline = (f"ENTRY – buy between {lo:,.2f} and {hi:,.2f}, stop {stop:,.2f}, "
+                    f"take profits {tp1:,.2f}–{tp2:,.2f} ({name_rr}).")
+        holder = f"Hold; trail your stop at {trailing:,.2f}."
+    elif call == "NEUTRAL":
+        headline = (f"NEUTRAL – no edge at {S0:,.2f}; a dip into {lo:,.2f}–{hi:,.2f} "
+                    f"would offer a better entry ({name_rr}).")
+        holder = (f"Hold with a stop at {trailing:,.2f}; consider trimming in the "
+                  f"{tp1:,.2f}–{tp2:,.2f} take-profit zone.")
+    else:
+        headline = ("OUT – " + "; ".join(out_reasons) +
+                    f". Avoid new buys; re-assess near {lo:,.2f}–{hi:,.2f}.")
+        holder = (f"Reduce or exit; at minimum keep a stop at "
+                  f"{min(trailing, S0 * 0.99):,.2f}.")
+    if trailing >= S0 and call != "OUT":
+        holder = (f"Price is already below the trailing stop ({trailing:,.2f}): short-term "
+                  f"momentum has turned – tighten risk or trim; hard stop {stop:,.2f}.")
+    reasons = [
+        f"Entry score {a.entry_score:.0f}/100, decline risk {a.decline_score:.0f}/100.",
+        f"Expected {h}-day move ±{sig_h:.1%} (GARCH), daily range ≈ {atr:,.2f} (ATR).",
+        f"Take-profit 1 is hit before the stop in "
+        f"{(i_tp < i_sl).mean():.0%} of simulated paths.",
+    ]
+    return TradePlan(call, headline, holder, S0, float(lo), float(hi), float(stop),
+                     float(stop - atr), float(tp1), float(tp2), trailing, atr, sig_h,
+                     float(rr), levels, supports, reasons)

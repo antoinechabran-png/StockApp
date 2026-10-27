@@ -229,7 +229,7 @@ with st.sidebar:
                "not investment advice.")
 
 st.title("📈 CAC 40 Stochastic Lab")
-tab1, tab_tr, tab2, tab3 = st.tabs(["🎯 Single share", "🚦 Entry / Exit",
+tab_tr, tab1, tab2, tab3 = st.tabs(["🚦 Entry / Exit", "🎯 Single share",
                                    "🧺 CAC 40 portfolio", "ℹ️ Method"])
 
 # =========================================================================== #
@@ -482,7 +482,7 @@ with tab1:
 def render_trade():
     st.markdown("Find a share by **ISIN**, by name or by Yahoo ticker, and get its entry, "
                 "stop and exit price ranges with a clear call.")
-    how = st.radio("Find share by", ["ISIN code", "CAC 40 list", "Yahoo ticker"],
+    how = st.radio("Find share by", ["CAC 40 list", "ISIN code", "Yahoo ticker"],
                    horizontal=True, key="tr_how")
     info = {}
     if how == "ISIN code":

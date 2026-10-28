@@ -9,6 +9,12 @@ Streamlit app for stochastic analysis of Paris-listed shares.
   chart of the entry zone, stop-loss zone, take-profit zone and trailing stop, a price ladder
   with touch probabilities, and an ENTRY / NEUTRAL / OUT call. Non-CAC 40 ISINs are looked
   up online (OpenFIGI, then Yahoo search).
+* **CAC 40 recommendations** – the Entry / Exit engine run on all 40 shares: call, entry zone,
+  stop, take-profit zone, trailing stop, risk/reward, probability of hitting the target first;
+  range chart, filters, action lists and CSV download.
+* **Daily trading** (toggle in the sidebar) – intraday candlesticks with VWAP, EMA 9/21,
+  opening range, pivot points and the GARCH expected range; BUY / WAIT / SELL call with entry,
+  stop and targets, and a rest-of-session Monte Carlo. Same CAC 40 / ISIN / ticker input.
 * Every tab shows a one-sentence 💡 interpretation of its results.
 * **CAC 40 portfolio** – holdings P&L, VaR/CVaR, beta, drawdown, risk contributions,
   correlation, CAC 40 market regime, and an entry screener over the 40 constituents.
@@ -18,7 +24,7 @@ Streamlit app for stochastic analysis of Paris-listed shares.
     streamlit run app.py
 
 ## Deploy on Streamlit Community Cloud
-Push `app.py`, `quant.py`, `insights.py`, `isin.py`, `requirements.txt` to a GitHub repo → share.streamlit.io →
+Push `app.py`, `quant.py`, `insights.py`, `isin.py`, `daytrade.py`, `requirements.txt` to a GitHub repo → share.streamlit.io →
 New app → main file `app.py`.
 
 ## Data

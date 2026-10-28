@@ -160,3 +160,43 @@ def screener(sc: pd.DataFrame) -> str:
     return (f"{len(fav)} of {len(sc)} shares show a favourable entry today and "
             f"{len(risky)} carry high decline risk; the best-ranked is "
             f"**{best.Name}** (score {best['Entry score']:.0f}).")
+
+
+# --------------------------------------------------------------------------- #
+# Daily trading & recommendations
+# --------------------------------------------------------------------------- #
+def day(dp, name: str) -> str:
+    when = "today" if dp.live else "for the next session"
+    side = "above" if dp.price > dp.vwap else "below"
+    tail = f" The simulation gives {_p(dp.mc['p_close_up'])} odds of closing above the current price."
+    if dp.call == "BUY":
+        return (f"Intraday signals for {name} lean **bullish** {when}: price is {side} VWAP "
+                f"and short-term momentum points up – favour buying dips toward "
+                f"{dp.entry_low:,.2f} with a stop at {dp.stop:,.2f}." + tail)
+    if dp.call == "SELL":
+        return (f"Intraday signals for {name} lean **bearish** {when}: price is {side} VWAP "
+                f"and momentum points down – avoid buying, and use bounces toward "
+                f"{dp.entry_high:,.2f} to exit longs." + tail)
+    return (f"Intraday signals for {name} give **no clear edge** {when}: wait for a break "
+            f"above {dp.triggers['buy_above']:,.2f} to buy or below "
+            f"{dp.triggers['sell_below']:,.2f} to sell." + tail)
+
+
+def reco(df: pd.DataFrame) -> str:
+    n = len(df)
+    cnt = df["Call"].value_counts()
+    ne, nn, no = (int(cnt.get(c, 0)) for c in ("ENTRY", "NEUTRAL", "OUT"))
+    nz = int(df["In zone"].sum())
+    txt = (f"{ne} of {n} CAC 40 shares are **ENTRY**, {nn} NEUTRAL and {no} OUT, and {nz} "
+           f"trade inside their entry zone right now; ")
+    e = df[df.Call == "ENTRY"]
+    if len(e):
+        b = e.sort_values(["Entry score", "R/R"], ascending=False).iloc[0]
+        return txt + (f"the strongest set-up is **{b.Name}** (entry score "
+                      f"{b['Entry score']:.0f}, risk/reward {b['R/R']:.1f}).")
+    nb = df[df.Call == "NEUTRAL"].sort_values("Entry score", ascending=False)
+    if len(nb):
+        b = nb.iloc[0]
+        return txt + (f"no share qualifies as ENTRY today – the closest is **{b.Name}** "
+                      f"(entry score {b['Entry score']:.0f}, needs ≥ 65).")
+    return txt + "the market backdrop is defensive – patience."

@@ -604,6 +604,7 @@ class TradePlan:
     levels: pd.DataFrame      # ladder with touch probabilities
     supports: dict
     reasons: list = field(default_factory=list)
+    p_tp_first: float = float("nan")   # P(take-profit 1 before stop), simulated
 
 
 def atr_close(prices: pd.Series, n: int = 14) -> float:
@@ -704,4 +705,5 @@ def trade_plan(a: Analysis, stop_atr: float = 2.0, trail_atr: float = 3.0) -> Tr
     ]
     return TradePlan(call, headline, holder, S0, float(lo), float(hi), float(stop),
                      float(stop - atr), float(tp1), float(tp2), trailing, atr, sig_h,
-                     float(rr), levels, supports, reasons)
+                     float(rr), levels, supports, reasons,
+                     p_tp_first=float((i_tp < i_sl).mean()))

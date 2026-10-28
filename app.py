@@ -19,6 +19,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import daytrade as dt
 import insights as ins
 import isin as isn
 import quant as q
@@ -222,6 +223,8 @@ with st.sidebar:
                        f"{len(st.session_state.csv_df)} rows")
     period = st.selectbox("History", list(PERIOD_DAYS), index=2,
                           help="10y+ gives GARCH and HMM enough crises to learn from.")
+    st.toggle("Daily-trading tab", value=True, key="show_dt",
+              help="Show the intraday (day-trading) module.")
     if st.button("↻ Refresh data"):
         st.cache_data.clear()
     st.divider()
@@ -229,8 +232,14 @@ with st.sidebar:
                "not investment advice.")
 
 st.title("📈 CAC 40 Stochastic Lab")
-tab_tr, tab1, tab2, tab3 = st.tabs(["🚦 Entry / Exit", "🎯 Single share",
-                                   "🧺 CAC 40 portfolio", "ℹ️ Method"])
+_names = (["🚦 Entry / Exit", "📋 CAC 40 recommendations"]
+          + (["⚡ Daily trading"] if st.session_state.get("show_dt", True) else [])
+          + ["🎯 Single share", "🧺 CAC 40 portfolio", "ℹ️ Method"])
+_tabs = dict(zip(_names, st.tabs(_names)))
+tab_tr, tab_reco = _tabs["🚦 Entry / Exit"], _tabs["📋 CAC 40 recommendations"]
+tab_dt = _tabs.get("⚡ Daily trading")
+tab1, tab2, tab3 = (_tabs["🎯 Single share"], _tabs["🧺 CAC 40 portfolio"],
+                    _tabs["ℹ️ Method"])
 
 # =========================================================================== #
 # TAB 1 - single share
@@ -477,39 +486,51 @@ with tab1:
 
 
 # =========================================================================== #
-# TAB - Entry / Exit
+# Shared share picker (CAC 40 list / ISIN / Yahoo ticker)
 # =========================================================================== #
-def render_trade():
-    st.markdown("Find a share by **ISIN**, by name or by Yahoo ticker, and get its entry, "
-                "stop and exit price ranges with a clear call.")
+def pick_share(prefix: str, default: str = "TotalEnergies"):
+    """Return (ticker, name) or None. Widgets keyed by prefix so tabs are independent."""
     how = st.radio("Find share by", ["CAC 40 list", "ISIN code", "Yahoo ticker"],
-                   horizontal=True, key="tr_how")
+                   horizontal=True, key=f"{prefix}_how")
     info = {}
     if how == "ISIN code":
-        code = st.text_input("ISIN", "FR0000121014", key="tr_isin",
+        code = st.text_input("ISIN", "FR0000121014", key=f"{prefix}_isin",
                              help="12 characters, e.g. FR0000121014 (LVMH), "
                                   "NL0000235190 (Airbus), FR0000120271 (TotalEnergies)")
         if not isn.isin_valid(code):
             st.error(f"“{code}” is not a valid ISIN – check the 12 characters and the "
                      "final check digit.")
-            return
+            return None
         try:
             info = lookup_isin(isn.clean_isin(code), online())
         except Exception as e:
             st.error(str(e) + ("" if online() else " Switch the data source to Yahoo "
                                "Finance to look up non-CAC 40 ISINs."))
-            return
+            return None
         ticker, name = info["ticker"], info["name"]
         st.caption(f"✓ {info['isin']} → **{name}** ({ticker}) · found via {info['source']}")
     elif how == "CAC 40 list":
-        name = st.selectbox("Share", list(CAC40), index=list(CAC40).index("TotalEnergies"),
-                            key="tr_pick")
+        name = st.selectbox("Share", list(CAC40), index=list(CAC40).index(default),
+                            key=f"{prefix}_pick")
         ticker = CAC40[name]
     else:
-        ticker = st.text_input("Yahoo ticker", "GTT.PA", key="tr_tk").strip().upper()
+        ticker = st.text_input("Yahoo ticker", "GTT.PA", key=f"{prefix}_tk").strip().upper()
         name = NAME_OF.get(ticker, ticker)
     if "isin" not in info and ticker in isn.ISIN_OF_TICKER:
         st.caption(f"ISIN {isn.ISIN_OF_TICKER[ticker]}")
+    return ticker, name
+
+
+# =========================================================================== #
+# TAB - Entry / Exit
+# =========================================================================== #
+def render_trade():
+    st.markdown("Find a share by **ISIN**, by name or by Yahoo ticker, and get its entry, "
+                "stop and exit price ranges with a clear call.")
+    picked = pick_share("tr")
+    if picked is None:
+        return
+    ticker, name = picked
 
     c = st.columns(3)
     horizon = c[0].slider("Holding horizon (trading days)", 5, 60, 20, 5, key="tr_h")
@@ -619,6 +640,336 @@ def render_trade():
 
 with tab_tr:
     render_trade()
+
+
+# =========================================================================== #
+# TAB - CAC 40 recommendations (Entry / Exit engine on every constituent)
+# =========================================================================== #
+CALL_ORDER = {"ENTRY": 0, "NEUTRAL": 1, "OUT": 2}
+CALL_EMOJI = {"ENTRY": "🟢", "NEUTRAL": "🟡", "OUT": "🔴"}
+
+
+def build_reco(prices: pd.DataFrame, horizon: int, stop_atr: float, trail_atr: float):
+    rows = []
+    cols = [t for t in CAC40.values() if t in prices]
+    bar = st.progress(0.0, text="Analysing CAC 40…")
+    for i, tk in enumerate(cols):
+        bar.progress((i + 1) / len(cols), text=f"Analysing {NAME_OF[tk]}…")
+        s = prices[tk].dropna()
+        if len(s) < 300:
+            continue
+        try:   # identical engine and settings to the Entry / Exit tab
+            a = run_analysis(s, horizon, 5000, "GARCH-t", "Zero", 0.08, 0.05, 3)
+            tp = q.trade_plan(a, stop_atr=stop_atr, trail_atr=trail_atr)
+        except Exception:
+            continue
+        in_zone = tp.entry_low <= tp.last <= tp.entry_high
+        to_zone = 0.0 if in_zone else (tp.entry_high / tp.last - 1 if tp.last > tp.entry_high
+                                       else tp.entry_low / tp.last - 1)
+        mid = (tp.entry_low + tp.entry_high) / 2
+        rows.append({
+            "Call": tp.call, "Name": NAME_OF[tk], "Ticker": tk,
+            "ISIN": isn.ISIN_OF_TICKER.get(tk, ""), "Last": tp.last,
+            "Entry low": tp.entry_low, "Entry high": tp.entry_high, "In zone": in_zone,
+            "To zone": to_zone, "Stop": tp.stop, "Stop vs entry": tp.stop / mid - 1,
+            "TP1": tp.tp1, "TP2": tp.tp2, "Trailing stop": tp.trailing_stop,
+            "R/R": tp.risk_reward, "P(TP1 first)": tp.p_tp_first,
+            "Entry score": a.entry_score, "Decline risk": a.decline_score,
+            "Regime": a.stats["regime"], "Advice": tp.headline, "Holders": tp.holder_action,
+        })
+    bar.empty()
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["_o"] = df.Call.map(CALL_ORDER)
+        df = df.sort_values(["_o", "Entry score"], ascending=[True, False]).drop(columns="_o")
+    return df.reset_index(drop=True)
+
+
+def render_reco():
+    st.markdown("The **Entry / Exit** analysis run on every CAC 40 share with the same "
+                "settings – the numbers match what you see in the Entry / Exit tab.")
+    c = st.columns([1, 1, 1, 1])
+    horizon = c[0].slider("Holding horizon (days)", 5, 60, 20, 5, key="rc_h")
+    stop_atr = c[1].slider("Stop (× daily range)", 1.0, 4.0, 2.0, 0.5, key="rc_sa")
+    trail_atr = c[2].slider("Trailing stop (× daily range)", 2.0, 5.0, 3.0, 0.5, key="rc_ta")
+    c[3].write("")
+    if c[3].button("Run CAC 40 analysis", type="primary", key="rc_run"):
+        px = get_prices(list(CAC40.values()), period)
+        if px.empty:
+            st.error("No price data returned.")
+            return
+        st.session_state.reco = (build_reco(px, horizon, stop_atr, trail_atr),
+                                 pd.Timestamp.now(tz="Europe/Paris").strftime("%d/%m/%Y %H:%M"),
+                                 (horizon, stop_atr, trail_atr))
+    if "reco" not in st.session_state or st.session_state.reco[0].empty:
+        st.info("Press **Run CAC 40 analysis** (about a minute the first time, then cached).")
+        return
+    df, when, (h0, sa0, ta0) = st.session_state.reco
+    if (h0, sa0, ta0) != (horizon, stop_atr, trail_atr):
+        st.warning("Settings changed since the last run – press Run to refresh.")
+    st.caption(f"Last run {when} · horizon {h0} days · stop {sa0}× · trailing {ta0}×")
+
+    cnt = df.Call.value_counts()
+    k = st.columns(4)
+    k[0].metric("🟢 ENTRY", int(cnt.get("ENTRY", 0)))
+    k[1].metric("🟡 NEUTRAL", int(cnt.get("NEUTRAL", 0)))
+    k[2].metric("🔴 OUT", int(cnt.get("OUT", 0)))
+    k[3].metric("In entry zone now", int(df["In zone"].sum()))
+    insight(ins.reco(df))
+
+    f1, f2 = st.columns([3, 1])
+    calls = f1.multiselect("Show calls", ["ENTRY", "NEUTRAL", "OUT"],
+                           ["ENTRY", "NEUTRAL", "OUT"], key="rc_calls")
+    only_zone = f2.checkbox("Only shares in their entry zone", key="rc_zone")
+    v = df[df.Call.isin(calls)]
+    if only_zone:
+        v = v[v["In zone"]]
+    if v.empty:
+        st.info("No share matches the filters.")
+        return
+
+    # ---- range chart (% vs current price, comparable across shares) ----------
+    labels = [f"{CALL_EMOJI[c_]} {n}" for c_, n in zip(v.Call, v.Name)]
+    seg = lambda a, b: sum(([x, y, None] for x, y in zip(a, b)), [])
+    ys = sum(([l_, l_, None] for l_ in labels), [])
+    fig = go.Figure()
+    fig.add_scatter(x=seg((v["Entry low"] / v.Last - 1) * 100, (v["Entry high"] / v.Last - 1) * 100),
+                    y=ys, mode="lines", line=dict(color=C_AQUA, width=9), name="Entry zone")
+    fig.add_scatter(x=seg((v.TP1 / v.Last - 1) * 100, (v.TP2 / v.Last - 1) * 100), y=ys,
+                    mode="lines", line=dict(color=C_BLUE, width=9), name="Take-profit zone")
+    fig.add_scatter(x=(v.Stop / v.Last - 1) * 100, y=labels, mode="markers", name="Stop-loss",
+                    marker=dict(symbol="line-ns", size=14, line=dict(width=3,
+                                color=REGIME_COL["Bear"])))
+    fig.add_scatter(x=(v["Trailing stop"] / v.Last - 1) * 100, y=labels, mode="markers",
+                    name="Trailing stop", marker=dict(symbol="diamond", size=8, color=C_ORANGE))
+    fig.add_vline(x=0, line_color=C_GRAY, line_width=1, annotation_text="today")
+    fig.update_yaxes(autorange="reversed", categoryorder="array", categoryarray=labels)
+    fig.update_xaxes(title="% from current price", ticksuffix="%", zeroline=False)
+    fig = style(fig, 140 + 24 * len(v), None)
+    fig.update_layout(hovermode="closest")
+    show(fig)
+    st.caption("Each row is one share: green = entry zone, blue = take-profit zone, red tick = "
+               "stop-loss for a new entry, orange diamond = trailing stop for holders, all in "
+               "% from today's price.")
+
+    st.dataframe(v.drop(columns=["Advice", "Holders"]).assign(
+        Call=v.Call.map(lambda c_: f"{CALL_EMOJI[c_]} {c_}")), hide_index=True,
+        width="stretch", height=min(38 * len(v) + 40, 760), column_config={
+            **{c_: st.column_config.NumberColumn(format="%.2f")
+               for c_ in ["Last", "Entry low", "Entry high", "Stop", "TP1", "TP2",
+                          "Trailing stop", "R/R"]},
+            "To zone": st.column_config.NumberColumn(
+                format="percent", help="Move needed to reach the entry zone (0 = inside)"),
+            "Stop vs entry": st.column_config.NumberColumn(
+                format="percent", help="Stop distance from the middle of the entry zone"),
+            "P(TP1 first)": st.column_config.NumberColumn(format="percent"),
+            "Entry score": st.column_config.ProgressColumn(min_value=0, max_value=100,
+                                                           format="%.0f"),
+            "Decline risk": st.column_config.ProgressColumn(min_value=0, max_value=100,
+                                                            format="%.0f")})
+    for cl in ["ENTRY", "NEUTRAL", "OUT"]:
+        sub = v[v.Call == cl]
+        if sub.empty:
+            continue
+        with st.expander(f"{CALL_EMOJI[cl]} {cl} – action list ({len(sub)})",
+                         expanded=cl == "ENTRY"):
+            st.markdown("\n".join(f"- **{r.Name}** – {r.Advice} *Holders:* {r.Holders}"
+                                  for r in sub.itertuples()))
+    st.download_button("⬇ Download recommendations (CSV)",
+                       v.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig"),
+                       f"cac40_recommendations_{pd.Timestamp.today():%Y%m%d}.csv", "text/csv")
+
+
+with tab_reco:
+    render_reco()
+
+
+# =========================================================================== #
+# TAB - Daily trading (intraday)
+# =========================================================================== #
+INTERVALS = {"1m": ("1m", "5d"), "5m": ("5m", "1mo"), "15m": ("15m", "1mo"),
+             "30m": ("30m", "1mo")}
+DT_CALL = {"BUY": ("🟢", st.success), "WAIT": ("🟡", st.warning), "SELL": ("🔴", st.error)}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_intraday_yahoo(ticker: str, interval: str, period_: str) -> pd.DataFrame:
+    import yfinance as yf
+    df = yf.download(ticker, period=period_, interval=interval, auto_adjust=False,
+                     progress=False, prepost=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl = [i for i in range(df.columns.nlevels)
+               if ticker in df.columns.get_level_values(i)]
+        df = df.xs(ticker, axis=1, level=lvl[0]) if lvl else df.droplevel(1, axis=1)
+    idx = pd.to_datetime(df.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("Europe/Paris").tz_localize(None)
+    df.index = idx
+    return df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
+
+
+def get_intraday(ticker: str, iv: str, daily: pd.Series):
+    src = st.session_state.get("source", "Yahoo Finance")
+    if src == "Demo (synthetic)":
+        bars = dt.synthetic_intraday(daily, int(iv[:-1]), key=ticker)
+        return bars, bars.index[-1] + pd.Timedelta(minutes=int(iv[:-1]))
+    if src == "Upload CSV":
+        return pd.DataFrame(), None
+    try:
+        return load_intraday_yahoo(ticker, *INTERVALS[iv]), None
+    except Exception as e:
+        st.error(f"Intraday download failed: {e}")
+        return pd.DataFrame(), None
+
+
+def render_daily():
+    st.markdown("Intraday view for **day trading**: VWAP, opening range, pivot points and the "
+                "expected range, with a BUY / WAIT / SELL call and levels for today.")
+    picked = pick_share("dt")
+    if picked is None:
+        return
+    ticker, name = picked
+    c = st.columns(3)
+    iv = c[0].selectbox("Bar size", list(INTERVALS), index=1, key="dt_iv")
+    or_min = c[1].selectbox("Opening range", [15, 30, 60], index=1, key="dt_or",
+                            format_func=lambda m: f"first {m} min")
+    n_sess = c[2].slider("Sessions shown", 1, 5, 2, key="dt_ns")
+
+    if st.session_state.get("source") == "Upload CSV":
+        st.warning("Daily trading needs intraday bars – switch the data source to Yahoo "
+                   "Finance (or Demo) in the sidebar.")
+        return
+    px = get_prices([ticker], period)
+    if px.empty or ticker not in px or px[ticker].dropna().shape[0] < 300:
+        st.warning(f"Not enough daily history for {ticker}.")
+        return
+    s = px[ticker].dropna()
+    a = run_analysis(s, 20, 5000, "GARCH-t", "Zero", 0.08, 0.05, 3)  # daily context
+    bars, now = get_intraday(ticker, iv, s)
+    if bars.empty or len(bars) < 40:
+        st.warning(f"No intraday data for {ticker} at {iv}.")
+        return
+    try:
+        dp = dt.analyze_day(bars, s, np.sqrt(a.garch.next_var) / 100,
+                            a.stats["p_bear_next"], or_minutes=or_min, now=now)
+    except ValueError as e:
+        st.warning(str(e))
+        return
+
+    status = (f"🟢 Session live · {dp.session_date:%a %d %b} · last bar "
+              f"{dp.bars.index[-1]:%H:%M}" if dp.live else
+              f"⚪ Market closed · last session {dp.session_date:%a %d %b} – plan for the "
+              "next open")
+    st.caption(status + " · Yahoo intraday data is delayed ~15 min for Euronext.")
+    icon, box = DT_CALL[dp.call]
+    box(f"### {icon} {dp.call}\n{dp.headline}")
+    insight(ins.day(dp, name))
+
+    k = st.columns(6)
+    k[0].metric("Last", f"{dp.price:,.2f}", pct(dp.price / dp.prev_close - 1, 2)
+                if dp.live else None)
+    k[1].metric("VWAP", f"{dp.vwap:,.2f}", pct(dp.price / dp.vwap - 1, 2), delta_color="off")
+    k[2].metric("Opening range", f"{dp.or_low:,.2f} – {dp.or_high:,.2f}")
+    k[3].metric("Expected range (1σ)", f"{dp.exp1[0]:,.2f} – {dp.exp1[1]:,.2f}")
+    k[4].metric("Range used", pct(dp.range_used, 0) if dp.live else "–",
+                help="Today's high–low as a share of the average daily range (ATR)")
+    k[5].metric("Intraday score", f"{dp.score:+.0f}", help="−100 bearish … +100 bullish; "
+                "BUY ≥ +35, SELL ≤ −35, with intraday confirmation")
+
+    # ---- candlestick chart ---------------------------------------------------
+    b = dp.bars
+    days = b.index.normalize().unique()[-n_sess:]
+    v = b[b.index.normalize().isin(days)]
+    fig = go.Figure(go.Candlestick(x=v.index, open=v.Open, high=v.High, low=v.Low,
+                                   close=v.Close, name="Price",
+                                   increasing_line_color=C_AQUA,
+                                   decreasing_line_color=REGIME_COL["Bear"]))
+    for i, dday in enumerate(days):
+        dv = v[v.index.normalize() == dday]
+        fig.add_scatter(x=dv.index, y=dv.VWAP, name="VWAP", legendgroup="vwap",
+                        showlegend=i == 0, line=dict(color=C_ORANGE, width=2))
+    fig.add_scatter(x=v.index, y=v.EMA9, name="EMA 9", line=dict(color=C_BLUE, width=1))
+    fig.add_scatter(x=v.index, y=v.EMA21, name="EMA 21", line=dict(color=C_GRAY, width=1))
+    tb = v[v.index.normalize() == days[-1]]
+    fig.add_shape(type="rect", x0=tb.index[0], x1=dp.or_end, y0=dp.or_low, y1=dp.or_high,
+                  fillcolor="rgba(138,137,132,0.18)", line_width=0, layer="below")
+    lv_lo, lv_hi = v.Low.min(), v.High.max()
+    near = lambda y: abs(y - dp.price) <= 2.5 * dp.daily_atr
+    for k_, y in dp.pivots.items():
+        if near(y):
+            fig.add_hline(y=y, line_dash="dot", line_color=C_GRAY, line_width=1,
+                          annotation_text=k_, annotation_position="right",
+                          annotation_font_color=C_GRAY)
+            lv_lo, lv_hi = min(lv_lo, y), max(lv_hi, y)
+    if dp.call in ("BUY", "SELL"):
+        fig.add_hrect(y0=dp.entry_low, y1=dp.entry_high, fillcolor="rgba(27,175,122,0.22)",
+                      line_width=0, layer="below", annotation_text="Entry zone",
+                      annotation_position="top left", annotation_font_color=C_AQUA)
+        for lab, y, col in [("Stop", dp.stop, REGIME_COL["Bear"]), ("Target 1", dp.t1, C_BLUE),
+                            ("Target 2", dp.t2, C_BLUE)]:
+            fig.add_hline(y=y, line_color=col, line_width=2,
+                          line_dash="solid" if lab == "Stop" else "dash",
+                          annotation_text=f"{lab} {y:,.2f}", annotation_position="top left",
+                          annotation_font_color=col)
+        lv_lo = min(lv_lo, dp.stop, dp.t2, dp.entry_low)
+        lv_hi = max(lv_hi, dp.stop, dp.t2, dp.entry_high)
+    else:
+        for lab, y, col in [("Buy above", dp.triggers["buy_above"], C_AQUA),
+                            ("Sell below", dp.triggers["sell_below"], REGIME_COL["Bear"])]:
+            fig.add_hline(y=y, line_color=col, line_width=2, line_dash="dash",
+                          annotation_text=f"{lab} {y:,.2f}", annotation_position="top left",
+                          annotation_font_color=col)
+            lv_lo, lv_hi = min(lv_lo, y), max(lv_hi, y)
+    pad = 0.15 * (lv_hi - lv_lo)
+    gaps = pd.bdate_range(days[0], days[-1]).difference(days)
+    fig.update_xaxes(rangeslider_visible=False, rangebreaks=[
+        dict(bounds=["sat", "mon"]), dict(bounds=[17.5, 9], pattern="hour"),
+        *([dict(values=[d_.strftime("%Y-%m-%d") for d_ in gaps])] if len(gaps) else [])])
+    fig.update_yaxes(range=[lv_lo - pad, lv_hi + pad])
+    show(style(fig, 540, "Price"))
+    st.caption("Grey box = opening range · orange = VWAP (resets each session) · dotted = "
+               "pivot points from the previous session · green band = entry zone · red = "
+               "stop · blue dashed = targets.")
+
+    cl, cr = st.columns([3, 2])
+    with cl:
+        st.markdown("**Intraday price ladder**")
+        st.dataframe(dp.ladder, hide_index=True, width="stretch", column_config={
+            "Price": st.column_config.NumberColumn(format="%.2f"),
+            "vs current": st.column_config.NumberColumn(format="percent"),
+            "P(touched by close)": st.column_config.ProgressColumn(
+                "P(touched by close)", min_value=0, max_value=1, format="percent")})
+    with cr:
+        st.markdown("**Rest-of-session simulation**")
+        m = st.columns(2)
+        m[0].metric("P(close above now)", pct(dp.mc["p_close_up"], 0))
+        m[1].metric("Close 5–95%", f"{dp.mc['close_q'][0.05]:,.2f} – "
+                                   f"{dp.mc['close_q'][0.95]:,.2f}")
+        if "p_t1_first" in dp.mc:
+            m = st.columns(2)
+            m[0].metric("Target 1 before stop", pct(dp.mc["p_t1_first"], 0))
+            m[1].metric("Stop before target 1", pct(dp.mc["p_stop_first"], 0))
+        st.markdown("**Why**")
+        st.markdown("\n".join(f"- {r}" for r in dp.reasons))
+        if dp.warnings:
+            st.markdown("\n".join(f"- ⚠️ {w}" for w in dp.warnings))
+        comp = pd.DataFrame({"Signal": list(dp.components),
+                             "Value": list(dp.components.values()),
+                             "Weight": [dt.WEIGHTS[x] for x in dp.components]})
+        st.dataframe(comp, hide_index=True, width="stretch", column_config={
+            "Value": st.column_config.ProgressColumn("Value (−1 … +1)", min_value=-1,
+                                                     max_value=1, format="%+.2f"),
+            "Weight": st.column_config.NumberColumn(format="%.2f")})
+    st.caption("Day-trading signals are short-lived and the data is delayed: use them to "
+               "prepare orders, not for live execution. Positions are meant to be closed "
+               "before 17:30.")
+
+
+if tab_dt is not None:
+    with tab_dt:
+        render_daily()
 
 
 # =========================================================================== #
@@ -808,6 +1159,28 @@ cross 15%, volatility stress 15%, RSI overbought 10%.
   ≥ 1.2 · otherwise NEUTRAL.
 * **ISIN lookup** – CAC 40 ISINs are built in; other ISINs are resolved online through
   OpenFIGI, then Yahoo search.
+
+### CAC 40 recommendations
+The Entry / Exit engine above run on every constituent with identical settings (same
+random seed), so each row matches the Entry / Exit tab. *In zone* = today's price is inside
+the entry zone; *To zone* = move needed to reach it; *P(TP1 first)* = share of simulated
+paths reaching take-profit 1 before the stop.
+
+### Daily trading
+* **Bars** – Yahoo intraday (1 – 30 min, delayed ~15 min), Euronext session 09:00–17:30.
+* **VWAP** (volume-weighted average price, resets daily), **EMA 9/21**, **opening range**
+  (high/low of the first 15/30/60 min), classic **pivot points** (P, R1/R2, S1/S2 from the
+  previous session), **expected range** = previous close × e^(±σ) with σ = GARCH
+  next-day volatility.
+* **Intraday score** (−100 … +100) – daily trend 20 %, daily regime 10 %, price vs VWAP 25 %,
+  EMA 9 vs 21 20 %, opening-range breakout 15 %, RSI extremes 10 % (contrarian). It is cut by
+  40 % once the day has used more than its average range (ATR).
+* **Call** – BUY ≥ +35 and SELL ≤ −35, each needing the intraday signals (VWAP, EMAs,
+  opening range) to agree; otherwise WAIT with break-out / break-down triggers.
+* **Levels** – risk unit = max(1.5 × bar ATR, 0.2 × daily ATR); entry between price and VWAP,
+  stop one risk unit beyond the zone, target 1 = 1.5 × risk, target 2 = next pivot (or 2.5 ×).
+* **Simulation** – 4,000 paths for the rest of the session, bootstrapping the last 20 sessions'
+  intraday returns rescaled to the GARCH daily volatility.
 
 ### Limits
 Filtered probabilities use only past data, but parameters are estimated on the full
